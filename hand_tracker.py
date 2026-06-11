@@ -78,7 +78,7 @@ TRACKING_CONFIDENCE  = 0.50
 PRESENCE_CONFIDENCE  = 0.50
 
 # ── DPI / Padding control ─────────────────────────────────────────────────────
-FRAME_PADDING = 100
+FRAME_PADDING = 150
 
 # Derived active-zone pixel boundaries (computed once at module level)
 PAD_X_MIN = FRAME_PADDING
@@ -87,12 +87,17 @@ PAD_Y_MIN = FRAME_PADDING
 PAD_Y_MAX = FRAME_HEIGHT - FRAME_PADDING   # 480 - 100 = 380
 
 # ── Smoothing ─────────────────────────────────────────────────────────────────
-SMOOTHING = 5
+SMOOTHING = 3
 
 # ── Gesture detection constants ────────────────────────────────────────────────
-TAP_THRESHOLD = 0.02         # normalised distance tip must go below knuckle (larger Y)
+TAP_THRESHOLD = 0.01         # normalised distance tip must go below knuckle (larger Y)
 RAISE_THRESHOLD = 0.01       # normalised distance tip must be above knuckle (smaller Y)
-SCROLL_SENSITIVITY = 1.5     # multiplier for scroll velocity
+SCROLL_SENSITIVITY = 5     # multiplier for scroll velocity
+
+# ── Modes ────────────────────────────────────────────────────────────────────
+MOVE = "MOVE"
+SCROLL = "SCROLL"
+IDLE = "IDLE"
 
 # ── Drawing colours (BGR) ─────────────────────────────────────────────────────
 BONE_COLOR        = (0,   220, 100)   # green  — skeleton connections
@@ -267,7 +272,7 @@ def map_to_screen(finger_x: float, finger_y: float,
     """
     screen_x = int(np.interp(finger_x,
                               [PAD_X_MIN, PAD_X_MAX],
-                              [screen_w,  0          ]))   # inverted for mirror
+                              [0,         screen_w   ]))
 
     screen_y = int(np.interp(finger_y,
                               [PAD_Y_MIN, PAD_Y_MAX],
@@ -357,6 +362,19 @@ def main():
             index_tapped  = is_finger_tapped(index_lm, index_pip_lm, TAP_THRESHOLD)
             middle_tapped = is_finger_tapped(middle_lm, middle_pip_lm, TAP_THRESHOLD)
 
+            # Check for folded fingers to detect closed fist
+            ring_lm = tracker.get_landmark(16)
+            ring_pip_lm = tracker.get_landmark(14)
+            pinky_lm = tracker.get_landmark(20)
+            pinky_pip_lm = tracker.get_landmark(18)
+
+            index_folded = index_lm.y > index_pip_lm.y
+            middle_folded = middle_lm.y > middle_pip_lm.y
+            ring_folded = ring_lm is not None and ring_pip_lm is not None and ring_lm.y > ring_pip_lm.y
+            pinky_folded = pinky_lm is not None and pinky_pip_lm is not None and pinky_lm.y > pinky_pip_lm.y
+
+            is_fist = index_folded and middle_folded and ring_folded and pinky_folded
+
             # Left Click: Index tapped (PIP knuckle + offset) while Middle is raised
             if index_tapped and middle_raised:
                 left_click_active = True
@@ -375,9 +393,17 @@ def main():
                     last_click_time = curr_time
                     print(f"[CLICK] Right Click triggered! (Middle Tip Y: {middle_lm.y:.3f} > Knuckle Y: {middle_pip_lm.y:.3f})")
 
-            # Scroll Mode: BOTH fingers raised above knuckles
-            elif index_raised and middle_raised:
+            # Scroll Mode: Closed fist (all fingers folded)
+            elif is_fist:
                 scroll_mode = True
+
+        # Determine the current MODE
+        if scroll_mode:
+            MODE = SCROLL
+        elif index_lm is not None:
+            MODE = MOVE
+        else:
+            MODE = IDLE
 
         # ── Handle scrolling ─────────────────────────────────────────────────
         if scroll_mode:
@@ -492,6 +518,11 @@ def main():
         fps    = 1.0 / (cur_t - prev_t) if prev_t else 0.0
         prev_t = cur_t
         draw_fps(frame, fps)
+
+        # ── Mode overlay ─────────────────────────────────────────────────────
+        cv2.putText(frame, f"MODE: {MODE}",
+                    (10, 65), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.85, (0, 255, 255), 2, cv2.LINE_AA)
 
         # ── Render ───────────────────────────────────────────────────────────
         cv2.imshow("AI Virtual Mouse", frame)
