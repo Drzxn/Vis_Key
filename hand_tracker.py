@@ -1,23 +1,26 @@
 """
 ============================================================
-  AI Virtual Mouse — Stage 3: Pinch-to-Click Gesture Control
+  AI Virtual Mouse — Stage 3+: Multi-Finger Tap & Scroll
 ============================================================
-  Description : Hand tracking with inner-frame padding (DPI)
-                and pinch-to-click gesture recognition.
+  Description : Hand tracking with dynamic finger tapping 
+                detection and two-finger scroll mode.
 
   Key features
   ─────────────
-  • FRAME_PADDING defines an inner bounding box inside the
-    camera frame. Only this region drives the cursor.
-  • np.interp() handles clamped linear interpolation.
-  • Low-pass (lerp) smoothing from Stage 2 is preserved.
-  • Pinch-to-Click: Measures Euclidean distance between 
-    Index Finger Tip (Landmark #8) and Thumb Tip (Landmark #4).
-  • Trigger pyautogui.click() when distance < 30 pixels.
-  • Cooldown variable 'last_click_time' (0.5s limit) prevents
-    rapid double/triple clicking.
-  • Visual indicator: Changes active zone box to green, turns
-    tips green, and draws a click circle when pinched.
+  • Movement Boundaries (DPI Box) and low-pass smoothing
+    from previous versions are fully preserved.
+  • All Pinch/Euclidean distance thumb math has been removed.
+  • Helper math.atan2 joint-angle and landmark Y-comparison
+    functions are defined for flexion/tapping detection.
+  • Left Click: Index Tip (#8) tapped below Index PIP (#6)
+    while Middle Finger is raised. Trigger pyautogui.leftClick().
+  • Right Click: Middle Tip (#12) tapped below Middle PIP (#10)
+    while Index Finger is raised. Trigger pyautogui.rightClick().
+  • Scroll Mode: Index and Middle Fingers both raised. Maps
+    their average Y-displacement to pyautogui.scroll().
+    Moves/Cursor updates are disabled during scroll mode.
+  • Visual Overlays: Custom indicators for Left Tap, Right Tap,
+    and Scroll mode.
   • Press Q to quit safely.
 
   Dependencies: opencv-python, mediapipe (>=0.10), pyautogui,
@@ -46,8 +49,13 @@ pyautogui.FAILSAFE = False   # no FailSafeException at screen corners
 pyautogui.PAUSE    = 0       # remove 0.1 s inter-call delay
 
 # ── Landmark indices ─────────────────────────────────────────────────────────
-INDEX_TIP = 8    # Index Finger Tip  — drives the cursor
-THUMB_TIP = 4    # Thumb Tip         — pinch-to-click partner
+INDEX_TIP = 8    # Index Finger Tip
+INDEX_PIP = 6    # Index PIP Joint (knuckle for tap detection)
+INDEX_MCP = 5    # Index Knuckle Joint
+
+MIDDLE_TIP = 12  # Middle Finger Tip
+MIDDLE_PIP = 10  # Middle PIP Joint (knuckle for tap detection)
+MIDDLE_MCP = 9   # Middle Knuckle Joint
 
 # ── Hand skeleton connections (21-point MediaPipe topology) ──────────────────
 HAND_CONNECTIONS = [
@@ -81,13 +89,23 @@ PAD_Y_MAX = FRAME_HEIGHT - FRAME_PADDING   # 480 - 100 = 380
 # ── Smoothing ─────────────────────────────────────────────────────────────────
 SMOOTHING = 5
 
+# ── Gesture detection constants ────────────────────────────────────────────────
+TAP_THRESHOLD = 0.02         # normalised distance tip must go below knuckle (larger Y)
+RAISE_THRESHOLD = 0.01       # normalised distance tip must be above knuckle (smaller Y)
+SCROLL_SENSITIVITY = 1.5     # multiplier for scroll velocity
+
 # ── Drawing colours (BGR) ─────────────────────────────────────────────────────
-BONE_COLOR    = (0,   220, 100)   # green  — skeleton connections
-JOINT_COLOR   = (255, 255, 255)   # white  — joint dots
-INDEX_COLOR   = (255, 100,  20)   # orange — index tip marker
-THUMB_COLOR   = (0,   200, 255)   # cyan   — thumb tip marker
-ZONE_COLOR    = (0,   180, 255)   # amber  — active zone border
-CURSOR_COLOR  = (0,   255, 180)   # mint   — HUD cursor readout
+BONE_COLOR        = (0,   220, 100)   # green  — skeleton connections
+JOINT_COLOR       = (255, 255, 255)   # white  — joint dots
+INDEX_COLOR       = (255, 100,  20)   # orange — index tip marker
+MIDDLE_COLOR      = (240, 160,  20)   # indigo — middle tip marker
+ZONE_COLOR        = (0,   180, 255)   # amber  — active zone border
+CURSOR_COLOR      = (0,   255, 180)   # mint   — HUD cursor readout
+
+# Gesture Colors (BGR)
+LEFT_CLICK_COLOR  = (0,   255, 0)     # green
+RIGHT_CLICK_COLOR = (255, 0,   0)     # blue
+SCROLL_COLOR      = (255, 0,   255)   # magenta
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -146,7 +164,51 @@ class HandTracker:
 
 
 # ════════════════════════════════════════════════════════════════════════════
-#  HELPERS
+#  MATH / GESTURE HELPERS
+# ════════════════════════════════════════════════════════════════════════════
+def get_joint_angle(tip, pip, mcp):
+    """
+    Calculate the joint flexion angle at the PIP joint using math.atan2.
+    This can be used to mathematically detect flexion.
+    """
+    if tip is None or pip is None or mcp is None:
+        return 180.0
+    # Vectors pip -> tip and pip -> mcp
+    v1_x, v1_y = tip.x - pip.x, tip.y - pip.y
+    v2_x, v2_y = mcp.x - pip.x, mcp.y - pip.y
+    
+    ang1 = math.atan2(v1_y, v1_x)
+    ang2 = math.atan2(v2_y, v2_x)
+    
+    angle = math.degrees(ang1 - ang2)
+    angle = abs(angle)
+    if angle > 180.0:
+        angle = 360.0 - angle
+    return angle
+
+
+def is_finger_tapped(tip_lm, pip_lm, threshold=TAP_THRESHOLD) -> bool:
+    """
+    Check if a finger is tapped down by seeing if the tip's Y position
+    is lower (higher coordinate value) than the PIP joint by a threshold.
+    """
+    if tip_lm is None or pip_lm is None:
+        return False
+    return tip_lm.y > (pip_lm.y + threshold)
+
+
+def is_finger_raised(tip_lm, pip_lm, threshold=RAISE_THRESHOLD) -> bool:
+    """
+    Check if a finger is raised by seeing if the tip's Y position
+    is higher (lower coordinate value) than the PIP joint by a threshold.
+    """
+    if tip_lm is None or pip_lm is None:
+        return False
+    return tip_lm.y < (pip_lm.y - threshold)
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  DRAW HELPERS
 # ════════════════════════════════════════════════════════════════════════════
 def draw_tip(frame, coords, color, label=""):
     """Highlight a landmark tip with a filled circle and text label."""
@@ -159,13 +221,12 @@ def draw_tip(frame, coords, color, label=""):
                         cv2.FONT_HERSHEY_SIMPLEX, 0.50, color, 2, cv2.LINE_AA)
 
 
-def draw_active_zone(frame, is_pinched=False):
+def draw_active_zone(frame, is_scrolling=False):
     """
     Draw the padded active tracking zone as a visible rectangle.
     The corners of this box correspond to the screen corners.
-    Keeping the finger inside this box gives full-screen cursor coverage.
     """
-    color = (0, 255, 0) if is_pinched else ZONE_COLOR
+    color = SCROLL_COLOR if is_scrolling else ZONE_COLOR
 
     # Outer dashed-style effect: draw a slightly larger dark rect first
     cv2.rectangle(frame,
@@ -178,7 +239,7 @@ def draw_active_zone(frame, is_pinched=False):
                   (PAD_X_MAX, PAD_Y_MAX),
                   color, 2)
     # Corner labels for clarity
-    label = "ACTIVE ZONE [CLICK]" if is_pinched else "ACTIVE ZONE"
+    label = "ACTIVE ZONE [SCROLL MODE]" if is_scrolling else "ACTIVE ZONE"
     cv2.putText(frame, label,
                 (PAD_X_MIN + 6, PAD_Y_MIN - 8),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.46, color, 1, cv2.LINE_AA)
@@ -239,8 +300,11 @@ def main():
     start_ns = time.perf_counter_ns()
     prev_t   = 0.0
 
-    # Cooldown tracking variable for click gesture
+    # Cooldown tracking variable for click gestures
     last_click_time = 0.0
+
+    # Variable to monitor scroll Y displacement
+    prev_scroll_y = None
 
     # Previous smoothed cursor position — seeded to screen centre
     plocX: float = screen_width  / 2
@@ -268,50 +332,119 @@ def main():
 
         # ── Get landmarks ────────────────────────────────────────────────────
         index_lm = tracker.get_landmark(INDEX_TIP)
-        thumb_lm = tracker.get_landmark(THUMB_TIP)
+        index_pip_lm = tracker.get_landmark(INDEX_PIP)
+        middle_lm = tracker.get_landmark(MIDDLE_TIP)
+        middle_pip_lm = tracker.get_landmark(MIDDLE_PIP)
 
-        # Frame pixel positions (used for distance calculation & annotations)
+        # Pixel positions for display annotations and scroll computations
         index_px = px(frame, index_lm)
-        thumb_px = px(frame, thumb_lm)
+        middle_px = px(frame, middle_pip_lm)  # Knuckle display point
+        # Get actual middle tip pixel for rendering tip
+        middle_tip_px = px(frame, middle_lm)
 
-        # ── Pinch-to-Click detection ─────────────────────────────────────────
-        is_pinched = False
-        if index_px is not None and thumb_px is not None:
-            # Euclidean distance in pixels using the math library
-            distance = math.sqrt((index_px[0] - thumb_px[0])**2 + (index_px[1] - thumb_px[1])**2)
+        # Initialize gesture active flags
+        left_click_active = False
+        right_click_active = False
+        scroll_mode = False
+
+        # ── Gesture recognition math & triggers ──────────────────────────────
+        if (index_lm is not None and index_pip_lm is not None and 
+            middle_lm is not None and middle_pip_lm is not None):
             
-            if distance < 30:
-                is_pinched = True
-                curr_time = time.time()
-                # Cooldown check: only allow click if at least 0.5s passed
-                if curr_time - last_click_time >= 0.5:
-                    pyautogui.click()
-                    last_click_time = curr_time
-                    print(f"[CLICK] Pinch detected! Distance: {distance:.1f} px. Triggered pyautogui.click()")
+            # Use Y-comparison rules
+            index_raised  = is_finger_raised(index_lm, index_pip_lm, RAISE_THRESHOLD)
+            middle_raised = is_finger_raised(middle_lm, middle_pip_lm, RAISE_THRESHOLD)
+            index_tapped  = is_finger_tapped(index_lm, index_pip_lm, TAP_THRESHOLD)
+            middle_tapped = is_finger_tapped(middle_lm, middle_pip_lm, TAP_THRESHOLD)
 
-        # ── Draw active zone (turns green if clicked/pinched) ────────────────
-        draw_active_zone(frame, is_pinched)
+            # Left Click: Index tapped (PIP knuckle + offset) while Middle is raised
+            if index_tapped and middle_raised:
+                left_click_active = True
+                curr_time = time.time()
+                if curr_time - last_click_time >= 0.5:
+                    pyautogui.leftClick()
+                    last_click_time = curr_time
+                    print(f"[CLICK] Left Click triggered! (Index Tip Y: {index_lm.y:.3f} > Knuckle Y: {index_pip_lm.y:.3f})")
+
+            # Right Click: Middle tapped (PIP knuckle + offset) while Index is raised
+            elif middle_tapped and index_raised:
+                right_click_active = True
+                curr_time = time.time()
+                if curr_time - last_click_time >= 0.5:
+                    pyautogui.rightClick()
+                    last_click_time = curr_time
+                    print(f"[CLICK] Right Click triggered! (Middle Tip Y: {middle_lm.y:.3f} > Knuckle Y: {middle_pip_lm.y:.3f})")
+
+            # Scroll Mode: BOTH fingers raised above knuckles
+            elif index_raised and middle_raised:
+                scroll_mode = True
+
+        # ── Handle scrolling ─────────────────────────────────────────────────
+        if scroll_mode:
+            if index_px is not None and middle_tip_px is not None:
+                # Combined average pixel Y position
+                avg_y = (index_px[1] + middle_tip_px[1]) / 2.0
+                
+                if prev_scroll_y is not None:
+                    # Inverted: moving hand UP decreases average Y (so displacement is positive)
+                    displacement = prev_scroll_y - avg_y
+                    scroll_amount = int(displacement * SCROLL_SENSITIVITY)
+                    if scroll_amount != 0:
+                        pyautogui.scroll(scroll_amount)
+                        print(f"[SCROLL] scrolling displacement: {displacement:.1f} px -> amount: {scroll_amount}")
+                prev_scroll_y = avg_y
+        else:
+            prev_scroll_y = None
+
+        # ── Draw active zone (changes color to Magenta in Scroll Mode) ──────
+        draw_active_zone(frame, scroll_mode)
 
         # ── Draw hand skeleton ───────────────────────────────────────────────
         tracker.draw_skeleton(frame)
 
-        # Tip markers (turn green if clicked/pinched)
-        index_color = (0, 255, 0) if is_pinched else INDEX_COLOR
-        thumb_color = (0, 255, 0) if is_pinched else THUMB_COLOR
+        # Dynamic Tip marker coloring
+        if left_click_active:
+            index_color = LEFT_CLICK_COLOR
+            middle_color = MIDDLE_COLOR
+        elif right_click_active:
+            index_color = INDEX_COLOR
+            middle_color = RIGHT_CLICK_COLOR
+        elif scroll_mode:
+            index_color = SCROLL_COLOR
+            middle_color = SCROLL_COLOR
+        else:
+            index_color = INDEX_COLOR
+            middle_color = MIDDLE_COLOR
+
         draw_tip(frame, index_px, index_color, label="Index #8")
-        draw_tip(frame, thumb_px, thumb_color, label="Thumb  #4")
+        draw_tip(frame, middle_tip_px, middle_color, label="Middle #12")
 
-        # Draw visual indicator circle around finger tips on pinch
-        if is_pinched and index_px is not None and thumb_px is not None:
-            mid_x = (index_px[0] + thumb_px[0]) // 2
-            mid_y = (index_px[1] + thumb_px[1]) // 2
-            # Outer indicator ring
-            cv2.circle(frame, (mid_x, mid_y), 30, (0, 255, 0), 2, cv2.LINE_AA)
-            cv2.putText(frame, "CLICK", (mid_x - 20, mid_y - 38),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.52, (0, 255, 0), 2, cv2.LINE_AA)
+        # ── Visual indicators / overlays ─────────────────────────────────────
+        if left_click_active and index_px is not None:
+            # Highlight index tip with green ring
+            cv2.circle(frame, index_px, 24, LEFT_CLICK_COLOR, 2, cv2.LINE_AA)
+            cv2.putText(frame, "L-CLICK", (index_px[0] - 25, index_px[1] - 25),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, LEFT_CLICK_COLOR, 2, cv2.LINE_AA)
 
-        # ── Cursor movement with padding + low-pass smoothing ────────────────
-        if index_lm is not None:
+        if right_click_active and middle_tip_px is not None:
+            # Highlight middle tip with blue ring
+            cv2.circle(frame, middle_tip_px, 24, RIGHT_CLICK_COLOR, 2, cv2.LINE_AA)
+            cv2.putText(frame, "R-CLICK", (middle_tip_px[0] - 25, middle_tip_px[1] - 25),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, RIGHT_CLICK_COLOR, 2, cv2.LINE_AA)
+
+        if scroll_mode and index_px is not None and middle_tip_px is not None:
+            # Connection line and scroll rings
+            cv2.circle(frame, index_px, 20, SCROLL_COLOR, 2, cv2.LINE_AA)
+            cv2.circle(frame, middle_tip_px, 20, SCROLL_COLOR, 2, cv2.LINE_AA)
+            cv2.line(frame, index_px, middle_tip_px, SCROLL_COLOR, 2, cv2.LINE_AA)
+            
+            mid_x = (index_px[0] + middle_tip_px[0]) // 2
+            mid_y = (index_px[1] + middle_tip_px[1]) // 2
+            cv2.putText(frame, "SCROLL", (mid_x - 25, mid_y - 25),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, SCROLL_COLOR, 2, cv2.LINE_AA)
+
+        # ── Cursor movement (Only active when NOT in Scroll Mode) ───────────
+        if index_lm is not None and not scroll_mode:
             # Convert normalised landmark to FRAME pixel position (pre-flip)
             finger_x_raw = index_lm.x * FRAME_WIDTH
             finger_y_raw = index_lm.y * FRAME_HEIGHT
@@ -342,9 +475,17 @@ def main():
             # Update previous position for next frame's lerp
             plocX, plocY = clocX, clocY
 
+        elif scroll_mode:
+            # HUD overlay indicating scroll mode
+            cv2.putText(frame,
+                        "SCROLL MODE ACTIVE",
+                        (10, FRAME_HEIGHT - 15),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.52,
+                        SCROLL_COLOR, 2, cv2.LINE_AA)
+
         # Landmark pixel readout in console
         if tracker.has_hand():
-            print(f"  Index Tip (#8): {str(index_px):<18}Thumb Tip (#4): {thumb_px}")
+            print(f"  Index Tip (#8): {str(index_px):<18}Middle Tip (#12): {middle_tip_px}")
 
         # ── FPS overlay ──────────────────────────────────────────────────────
         cur_t  = time.perf_counter()
