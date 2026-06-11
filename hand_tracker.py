@@ -1,20 +1,23 @@
 """
 ============================================================
-  AI Virtual Mouse — Stage 2+: DPI Padding & Cursor Control
+  AI Virtual Mouse — Stage 3: Pinch-to-Click Gesture Control
 ============================================================
-  Description : Hand tracking with a configurable inner-frame
-                padding zone for precise DPI-style control.
+  Description : Hand tracking with inner-frame padding (DPI)
+                and pinch-to-click gesture recognition.
 
   Key features
   ─────────────
   • FRAME_PADDING defines an inner bounding box inside the
     camera frame. Only this region drives the cursor.
-  • Moving the finger to the edge of the box maps to the
-    absolute screen edge — no need to reach the camera border.
-  • np.interp() handles clamped linear interpolation cleanly.
-  • A visible cv2.rectangle() shows the active zone in the
-    preview window for easy visual calibration.
+  • np.interp() handles clamped linear interpolation.
   • Low-pass (lerp) smoothing from Stage 2 is preserved.
+  • Pinch-to-Click: Measures Euclidean distance between 
+    Index Finger Tip (Landmark #8) and Thumb Tip (Landmark #4).
+  • Trigger pyautogui.click() when distance < 30 pixels.
+  • Cooldown variable 'last_click_time' (0.5s limit) prevents
+    rapid double/triple clicking.
+  • Visual indicator: Changes active zone box to green, turns
+    tips green, and draws a click circle when pinched.
   • Press Q to quit safely.
 
   Dependencies: opencv-python, mediapipe (>=0.10), pyautogui,
@@ -26,6 +29,7 @@
 
 import cv2
 import time
+import math
 import numpy as np
 import pyautogui
 import mediapipe as mp
@@ -43,7 +47,7 @@ pyautogui.PAUSE    = 0       # remove 0.1 s inter-call delay
 
 # ── Landmark indices ─────────────────────────────────────────────────────────
 INDEX_TIP = 8    # Index Finger Tip  — drives the cursor
-THUMB_TIP = 4    # Thumb Tip         — reserved for click in Stage 3
+THUMB_TIP = 4    # Thumb Tip         — pinch-to-click partner
 
 # ── Hand skeleton connections (21-point MediaPipe topology) ──────────────────
 HAND_CONNECTIONS = [
@@ -66,17 +70,6 @@ TRACKING_CONFIDENCE  = 0.50
 PRESENCE_CONFIDENCE  = 0.50
 
 # ── DPI / Padding control ─────────────────────────────────────────────────────
-# FRAME_PADDING defines how many pixels to inset from each edge of the camera
-# frame to create the "active tracking zone".
-#
-# With FRAME_WIDTH=640, FRAME_HEIGHT=480, FRAME_PADDING=100:
-#   Active X range : 100  →  540   (width  = 440 px)
-#   Active Y range : 100  →  380   (height = 280 px)
-#
-# Any finger position INSIDE this box maps linearly to the FULL screen.
-# Any position AT or BEYOND the edge clamps to the screen boundary.
-# Increase FRAME_PADDING to make control feel more like a high-DPI mouse
-# (less physical movement → more cursor travel).
 FRAME_PADDING = 100
 
 # Derived active-zone pixel boundaries (computed once at module level)
@@ -86,8 +79,6 @@ PAD_Y_MIN = FRAME_PADDING
 PAD_Y_MAX = FRAME_HEIGHT - FRAME_PADDING   # 480 - 100 = 380
 
 # ── Smoothing ─────────────────────────────────────────────────────────────────
-# Low-pass filter divisor. Higher = smoother glide, lower = snappier.
-# Range guide:  3 = snappy,  5 = balanced,  7 = ultra-smooth
 SMOOTHING = 5
 
 # ── Drawing colours (BGR) ─────────────────────────────────────────────────────
@@ -168,12 +159,14 @@ def draw_tip(frame, coords, color, label=""):
                         cv2.FONT_HERSHEY_SIMPLEX, 0.50, color, 2, cv2.LINE_AA)
 
 
-def draw_active_zone(frame):
+def draw_active_zone(frame, is_pinched=False):
     """
     Draw the padded active tracking zone as a visible rectangle.
     The corners of this box correspond to the screen corners.
     Keeping the finger inside this box gives full-screen cursor coverage.
     """
+    color = (0, 255, 0) if is_pinched else ZONE_COLOR
+
     # Outer dashed-style effect: draw a slightly larger dark rect first
     cv2.rectangle(frame,
                   (PAD_X_MIN - 2, PAD_Y_MIN - 2),
@@ -183,11 +176,12 @@ def draw_active_zone(frame):
     cv2.rectangle(frame,
                   (PAD_X_MIN, PAD_Y_MIN),
                   (PAD_X_MAX, PAD_Y_MAX),
-                  ZONE_COLOR, 2)
+                  color, 2)
     # Corner labels for clarity
-    cv2.putText(frame, "ACTIVE ZONE",
+    label = "ACTIVE ZONE [CLICK]" if is_pinched else "ACTIVE ZONE"
+    cv2.putText(frame, label,
                 (PAD_X_MIN + 6, PAD_Y_MIN - 8),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.46, ZONE_COLOR, 1, cv2.LINE_AA)
+                cv2.FONT_HERSHEY_SIMPLEX, 0.46, color, 1, cv2.LINE_AA)
 
 
 def draw_fps(frame, fps: float):
@@ -209,18 +203,6 @@ def map_to_screen(finger_x: float, finger_y: float,
     """
     Map a finger's pixel position within the camera frame to screen coordinates
     using the padded active zone as the input range.
-
-    np.interp(value, [in_min, in_max], [out_min, out_max]) performs clamped
-    linear interpolation — values outside [in_min, in_max] are automatically
-    clamped to [out_min, out_max], so touching/crossing the zone border maps
-    exactly to the screen edge.
-
-    X is already correct because cv2.flip(frame, 1) has mirrored the display;
-    the raw landmark .x from MediaPipe is pre-flip, so we invert it:
-      lm.x = 0.0  →  left side of original frame
-                  →  right side of mirrored display
-                  →  finger_x_pixel = FRAME_WIDTH (large)
-                  →  np.interp maps to screen_w (right edge)  ✓
     """
     screen_x = int(np.interp(finger_x,
                               [PAD_X_MIN, PAD_X_MAX],
@@ -257,8 +239,10 @@ def main():
     start_ns = time.perf_counter_ns()
     prev_t   = 0.0
 
-    # Previous smoothed cursor position — seeded to screen centre so the
-    # cursor doesn't snap from (0, 0) on the first detection frame.
+    # Cooldown tracking variable for click gesture
+    last_click_time = 0.0
+
+    # Previous smoothed cursor position — seeded to screen centre
     plocX: float = screen_width  / 2
     plocY: float = screen_height / 2
 
@@ -282,41 +266,63 @@ def main():
         # ── MediaPipe inference ──────────────────────────────────────────────
         tracker.process(frame, ts_ms)
 
-        # ── Draw active zone BEFORE skeleton so skeleton sits on top ─────────
-        draw_active_zone(frame)
-
-        # ── Draw hand skeleton ───────────────────────────────────────────────
-        tracker.draw_skeleton(frame)
-
         # ── Get landmarks ────────────────────────────────────────────────────
         index_lm = tracker.get_landmark(INDEX_TIP)
         thumb_lm = tracker.get_landmark(THUMB_TIP)
 
-        # Frame pixel positions (used for annotation only — post-flip display)
+        # Frame pixel positions (used for distance calculation & annotations)
         index_px = px(frame, index_lm)
         thumb_px = px(frame, thumb_lm)
 
-        # Tip markers
-        draw_tip(frame, index_px, INDEX_COLOR, label="Index #8")
-        draw_tip(frame, thumb_px, THUMB_COLOR, label="Thumb  #4")
+        # ── Pinch-to-Click detection ─────────────────────────────────────────
+        is_pinched = False
+        if index_px is not None and thumb_px is not None:
+            # Euclidean distance in pixels using the math library
+            distance = math.sqrt((index_px[0] - thumb_px[0])**2 + (index_px[1] - thumb_px[1])**2)
+            
+            if distance < 30:
+                is_pinched = True
+                curr_time = time.time()
+                # Cooldown check: only allow click if at least 0.5s passed
+                if curr_time - last_click_time >= 0.5:
+                    pyautogui.click()
+                    last_click_time = curr_time
+                    print(f"[CLICK] Pinch detected! Distance: {distance:.1f} px. Triggered pyautogui.click()")
+
+        # ── Draw active zone (turns green if clicked/pinched) ────────────────
+        draw_active_zone(frame, is_pinched)
+
+        # ── Draw hand skeleton ───────────────────────────────────────────────
+        tracker.draw_skeleton(frame)
+
+        # Tip markers (turn green if clicked/pinched)
+        index_color = (0, 255, 0) if is_pinched else INDEX_COLOR
+        thumb_color = (0, 255, 0) if is_pinched else THUMB_COLOR
+        draw_tip(frame, index_px, index_color, label="Index #8")
+        draw_tip(frame, thumb_px, thumb_color, label="Thumb  #4")
+
+        # Draw visual indicator circle around finger tips on pinch
+        if is_pinched and index_px is not None and thumb_px is not None:
+            mid_x = (index_px[0] + thumb_px[0]) // 2
+            mid_y = (index_px[1] + thumb_px[1]) // 2
+            # Outer indicator ring
+            cv2.circle(frame, (mid_x, mid_y), 30, (0, 255, 0), 2, cv2.LINE_AA)
+            cv2.putText(frame, "CLICK", (mid_x - 20, mid_y - 38),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.52, (0, 255, 0), 2, cv2.LINE_AA)
 
         # ── Cursor movement with padding + low-pass smoothing ────────────────
         if index_lm is not None:
-            # Convert normalised landmark to FRAME pixel position.
-            # We need the raw pixel coordinate in the original (pre-flip) space
-            # so the np.interp inversion inside map_to_screen works correctly.
-            # lm.x is pre-flip, so: finger_x_raw = lm.x * FRAME_WIDTH
+            # Convert normalised landmark to FRAME pixel position (pre-flip)
             finger_x_raw = index_lm.x * FRAME_WIDTH
             finger_y_raw = index_lm.y * FRAME_HEIGHT
 
-            # Map padded zone → screen coordinates (includes mirror inversion)
+            # Map padded zone → screen coordinates
             screen_x, screen_y = map_to_screen(
                 finger_x_raw, finger_y_raw,
                 screen_width, screen_height
             )
 
             # Low-pass filter (lerp):
-            # cursor_new = cursor_old + (target - cursor_old) / SMOOTHING
             clocX = plocX + (screen_x - plocX) / SMOOTHING
             clocY = plocY + (screen_y - plocY) / SMOOTHING
 
