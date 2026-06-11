@@ -92,11 +92,18 @@ SMOOTHING = 3
 # ── Gesture detection constants ────────────────────────────────────────────────
 TAP_THRESHOLD = 0.01         # normalised distance tip must go below knuckle (larger Y)
 RAISE_THRESHOLD = 0.01       # normalised distance tip must be above knuckle (smaller Y)
-SCROLL_SENSITIVITY = 5     # multiplier for scroll velocity
+SCROLL_SENSITIVITY = 5       # multiplier for scroll velocity
+CURSOR_SENSITIVITY = 1.8     # multiplier to make cursor reach screen corners easily
+SWIPE_VELOCITY_THRESHOLD = 2.0  # normalised X speed threshold for desktop swipe
 
 # ── Modes ────────────────────────────────────────────────────────────────────
 MOVE = "MOVE"
+LEFT_CLICK = "LEFT CLICK"
+RIGHT_CLICK = "RIGHT CLICK"
 SCROLL = "SCROLL"
+TASK_VIEW = "TASK VIEW"
+DESKTOP_LEFT = "DESKTOP LEFT"
+DESKTOP_RIGHT = "DESKTOP RIGHT"
 IDLE = "IDLE"
 
 # ── Drawing colours (BGR) ─────────────────────────────────────────────────────
@@ -270,11 +277,18 @@ def map_to_screen(finger_x: float, finger_y: float,
     Map a finger's pixel position within the camera frame to screen coordinates
     using the padded active zone as the input range.
     """
-    screen_x = int(np.interp(finger_x,
+    center_x = (PAD_X_MIN + PAD_X_MAX) / 2
+    center_y = (PAD_Y_MIN + PAD_Y_MAX) / 2
+
+    # Scale the coordinates around the active zone center to increase sensitivity
+    finger_x_sens = center_x + (finger_x - center_x) * CURSOR_SENSITIVITY
+    finger_y_sens = center_y + (finger_y - center_y) * CURSOR_SENSITIVITY
+
+    screen_x = int(np.interp(finger_x_sens,
                               [PAD_X_MIN, PAD_X_MAX],
                               [0,         screen_w   ]))
 
-    screen_y = int(np.interp(finger_y,
+    screen_y = int(np.interp(finger_y_sens,
                               [PAD_Y_MIN, PAD_Y_MAX],
                               [0,          screen_h  ]))
 
@@ -310,6 +324,19 @@ def main():
 
     # Variable to monitor scroll Y displacement
     prev_scroll_y = None
+
+    # Swipe velocity tracking variables
+    prev_wrist_x = None
+    prev_wrist_time = None
+    swipe_cooldown_until = 0.0
+    desktop_swipe_action = None
+    desktop_swipe_time = 0.0
+
+    # Task View gesture tracking variables
+    three_fingers_start_time = None
+    task_view_triggered = False
+    last_task_view_time = 0.0
+    task_view_display_time = 0.0
 
     # Previous smoothed cursor position — seeded to screen centre
     plocX: float = screen_width  / 2
@@ -351,6 +378,24 @@ def main():
         left_click_active = False
         right_click_active = False
         scroll_mode = False
+        task_view_active = False
+
+        # Track horizontal swipe velocity using mirrored wrist X coordinate
+        wrist_lm = tracker.get_landmark(0)
+        velocity_x = 0.0
+        curr_time = time.time()
+        if wrist_lm is not None:
+            # Mirrored X coordinate to match physical hand direction (left/right)
+            mirrored_wrist_x = 1.0 - wrist_lm.x
+            if prev_wrist_x is not None and prev_wrist_time is not None:
+                dt = curr_time - prev_wrist_time
+                if dt > 0:
+                    velocity_x = (mirrored_wrist_x - prev_wrist_x) / dt
+            prev_wrist_x = mirrored_wrist_x
+            prev_wrist_time = curr_time
+        else:
+            prev_wrist_x = None
+            prev_wrist_time = None
 
         # ── Gesture recognition math & triggers ──────────────────────────────
         if (index_lm is not None and index_pip_lm is not None and 
@@ -375,31 +420,79 @@ def main():
 
             is_fist = index_folded and middle_folded and ring_folded and pinky_folded
 
-            # Left Click: Index tapped (PIP knuckle + offset) while Middle is raised
-            if index_tapped and middle_raised:
-                left_click_active = True
-                curr_time = time.time()
-                if curr_time - last_click_time >= 0.5:
-                    pyautogui.leftClick()
-                    last_click_time = curr_time
-                    print(f"[CLICK] Left Click triggered! (Index Tip Y: {index_lm.y:.3f} > Knuckle Y: {index_pip_lm.y:.3f})")
+            # Get Ring and Pinky statuses for Task View
+            ring_raised  = is_finger_raised(ring_lm, ring_pip_lm, RAISE_THRESHOLD) if (ring_lm and ring_pip_lm) else False
+            pinky_raised = is_finger_raised(pinky_lm, pinky_pip_lm, RAISE_THRESHOLD) if (pinky_lm and pinky_pip_lm) else False
+            
+            three_fingers_raised = index_raised and middle_raised and ring_raised and pinky_folded
 
-            # Right Click: Middle tapped (PIP knuckle + offset) while Index is raised
-            elif middle_tapped and index_raised:
-                right_click_active = True
-                curr_time = time.time()
-                if curr_time - last_click_time >= 0.5:
-                    pyautogui.rightClick()
-                    last_click_time = curr_time
-                    print(f"[CLICK] Right Click triggered! (Middle Tip Y: {middle_lm.y:.3f} > Knuckle Y: {middle_pip_lm.y:.3f})")
+            # ── PRIORITY SYSTEM ──
+            
+            # 1. Desktop Swipe
+            if is_fist and (velocity_x > SWIPE_VELOCITY_THRESHOLD or velocity_x < -SWIPE_VELOCITY_THRESHOLD):
+                if curr_time > swipe_cooldown_until:
+                    if velocity_x > SWIPE_VELOCITY_THRESHOLD:
+                        pyautogui.hotkey('ctrl', 'win', 'right')
+                        desktop_swipe_action = "RIGHT"
+                        desktop_swipe_time = curr_time
+                        swipe_cooldown_until = curr_time + 1.0
+                        print(f"[SWIPE] Desktop Next triggered! Velocity: {velocity_x:.2f}")
+                    else:
+                        pyautogui.hotkey('ctrl', 'win', 'left')
+                        desktop_swipe_action = "LEFT"
+                        desktop_swipe_time = curr_time
+                        swipe_cooldown_until = curr_time + 1.0
+                        print(f"[SWIPE] Desktop Previous triggered! Velocity: {velocity_x:.2f}")
 
-            # Scroll Mode: Closed fist (all fingers folded)
+            # 2. Task View (Held for at least 1 second)
+            elif three_fingers_raised:
+                if three_fingers_start_time is None:
+                    three_fingers_start_time = curr_time
+                elif curr_time - three_fingers_start_time >= 1.0 and not task_view_triggered:
+                    if curr_time - last_task_view_time >= 1.5:
+                        pyautogui.hotkey('win', 'tab')
+                        task_view_triggered = True
+                        last_task_view_time = curr_time
+                        task_view_display_time = curr_time
+                        print("[TASK VIEW] win+tab triggered")
+                task_view_active = True
+
+            # 3. Scroll Mode
             elif is_fist:
                 scroll_mode = True
 
+            # 4. Right Click
+            elif middle_tapped and index_raised:
+                right_click_active = True
+                if curr_time - last_click_time >= 0.5:
+                    pyautogui.rightClick()
+                    last_click_time = curr_time
+                    print("[CLICK] Right Click triggered!")
+
+            # 5. Left Click
+            elif index_tapped and middle_raised:
+                left_click_active = True
+                if curr_time - last_click_time >= 0.5:
+                    pyautogui.leftClick()
+                    last_click_time = curr_time
+                    print("[CLICK] Left Click triggered!")
+
+            # Reset three fingers timer if not raised in this frame
+            if not three_fingers_raised:
+                three_fingers_start_time = None
+                task_view_triggered = False
+
         # Determine the current MODE
-        if scroll_mode:
+        if desktop_swipe_action is not None and curr_time - desktop_swipe_time < 1.0:
+            MODE = f"DESKTOP {desktop_swipe_action}"
+        elif curr_time - task_view_display_time < 1.0:
+            MODE = "TASK VIEW"
+        elif scroll_mode:
             MODE = SCROLL
+        elif left_click_active:
+            MODE = LEFT_CLICK
+        elif right_click_active:
+            MODE = RIGHT_CLICK
         elif index_lm is not None:
             MODE = MOVE
         else:
@@ -469,8 +562,18 @@ def main():
             cv2.putText(frame, "SCROLL", (mid_x - 25, mid_y - 25),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, SCROLL_COLOR, 2, cv2.LINE_AA)
 
-        # ── Cursor movement (Only active when NOT in Scroll Mode) ───────────
-        if index_lm is not None and not scroll_mode:
+        # ── On-screen temporary overlays for swipe/task view ─────────────────
+        if desktop_swipe_action is not None and curr_time - desktop_swipe_time < 1.0:
+            cv2.putText(frame, f"DESKTOP {desktop_swipe_action}",
+                        (FRAME_WIDTH // 2 - 140, FRAME_HEIGHT // 2),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 0, 255), 3, cv2.LINE_AA)
+        elif curr_time - task_view_display_time < 1.0:
+            cv2.putText(frame, "TASK VIEW",
+                        (FRAME_WIDTH // 2 - 80, FRAME_HEIGHT // 2),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 0, 255), 3, cv2.LINE_AA)
+
+        # ── Cursor movement (Only active when NOT in Scroll/Task View/Swipe Mode) ──
+        if index_lm is not None and not scroll_mode and not task_view_active and desktop_swipe_action is None:
             # Convert normalised landmark to FRAME pixel position (pre-flip)
             finger_x_raw = index_lm.x * FRAME_WIDTH
             finger_y_raw = index_lm.y * FRAME_HEIGHT
