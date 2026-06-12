@@ -90,7 +90,7 @@ PAD_Y_MAX = FRAME_HEIGHT - FRAME_PADDING   # 480 - 100 = 380
 SMOOTHING = 3
 
 # ── Gesture detection constants ────────────────────────────────────────────────
-TAP_THRESHOLD = 0.01         # normalised distance tip must go below knuckle (larger Y)
+TAP_THRESHOLD = 0.005         # normalised distance tip must go below knuckle (larger Y)
 RAISE_THRESHOLD = 0.01       # normalised distance tip must be above knuckle (smaller Y)
 SCROLL_SENSITIVITY = 5       # multiplier for scroll velocity
 CURSOR_SENSITIVITY = 1.8     # multiplier to make cursor reach screen corners easily
